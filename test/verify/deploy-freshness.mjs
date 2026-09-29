@@ -27,14 +27,17 @@ const ROOT = resolve(HERE, '..', '..');
 const APP_ROOT = (process.env.DSH_APP_ROOT ?? 'E:\\DSH').toLowerCase();
 
 /**
- * 部署当时（2026-09-29 17:51:58 构建、17:52:48 重启）产物的**大小**记录。
+ * 部署当时（2026-09-29 21:01:05 构建、21:00:12 重启）产物的**大小**记录。
  * 用途：当 mtime 判据因"之后又 build 了一次"而不成立时，用大小/哈希确认内容是否同一。
+ *
+ * ⚠️ 更新史：17:54 那一版是 T16 **之前**的（`host/routes.js` 6,747 B、`host/recycle-store.js` 27,011 B）；
+ * T16 把判据改为 `sessionController` 后这两者变成 **8,335 B / 27,089 B** —— 沿用旧表会误报"内容不同"。
  */
 const EXPECTED = new Map([
 	['index.js', 227],
-	['client.js', 42345],
-	['host/routes.js', 6747],
-	['host/recycle-store.js', 27011]
+	['client.js', 43825],
+	['host/routes.js', 8335],
+	['host/recycle-store.js', 27089]
 ]);
 
 const lines = [];
