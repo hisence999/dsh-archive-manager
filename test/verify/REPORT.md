@@ -677,3 +677,88 @@ ENTRY_ID_PATTERN   = /^(\d{1,17})@([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/
 
 - §10.10（会话 id 两形态）★ 独立验证；§10.11 的 HMR 结论已在 §2 规则 7 **更正并说明依据被证伪**；§13.6 的 A5 修前基准（幽灵行 1 条）与 §14.3 的终判（幽灵行 0）**同一条命令、同一个盘、互为对照**；§14.2 的部署判据补齐了"live 跑的到底是哪份代码"这一此前缺失的可复现环节。
 - 早期判定表（§10.1 / §12.2 / §13.5）保留为历史中间态，顶部已有指向 §14 的醒目说明。
+
+## 15. rc.2 复核快照（2026-09-29 20:50）— 版本标注刷新 + T16/T17 复核
+
+### 15.1 环境变更（★ 全部我自己读的）
+
+| 项 | 我读到的值 |
+|---|---|
+| `E:\DSH\resources\app.asar` | mtime **2026-09-29T10:34:26Z**（= 本地 18:34:26） |
+| 运行中运行时 | `@deepseek-ai/dsh-desktop-runtime` / `@deepseek-ai/dsh` = **0.2.0-rc.2**（本会话内由 rc.1 自动升级） |
+| 运行中前端资源 | **`index-5SrrfWpU.js`**（原 rc.1 为 `index-Dy0OhsZ5.js`） |
+| 参照树（profile 安装） | 仍是 **0.2.0-rc.1**（`index-Dy0OhsZ5.js`）→ 两源**版本不同**，脚本已显式打印该差异 |
+| 宿主进程最早起始 | **18:47:41** > asar mtime 18:34:26 ⇒ 运行中的确实是 rc.2 |
+| 我的本轮构建 | **20:47:36** > 进程起始 18:47:41 ⇒ **宿主侧 T16 尚未 live**（与 lead 判断一致） |
+
+### 15.2 rc.2 静态复核结果（★ 全部我跑，均 PASS）
+
+| 检查 | 结果 |
+|---|---|
+| `node scripts\build.mjs` | exit 0（`lib/client.js` **43,825 B**） |
+| `node --test "test/**/*.test.mjs"` | **120/120 PASS** |
+| `facts-check.mjs` | **8 PASS / 0 MISMATCH**：lead 修复 PLAN §10.1（三版本并列）后那条 MISMATCH **已消除**；我的判据是"PLAN 必须引用 asar 里**动态解析出的**真实资源名" |
+| `platform-modules-check.mjs` | rc.2 基座表 **9 键 == DECLARED** ✅；参照树 rc.1 基座表 **9 键 == DECLARED** ✅（跨版本交叉验证仍有效） |
+| `scripts\check-routes-against-host.mjs`（rc.2 真实校验器） | **4/4 PASS** |
+| `host-validator.mjs`（我补的负控） | **22 项 PASS** |
+| `theme-tokens.mjs` | **10/10 令牌在 rc.2 官方 CSS 中存在**（用量由 18 降到 10：T10/T17 改用官方原子件后自绘样式减少） |
+| `ghost-row-check.mjs` / `a5-invariant.mjs` | **幽灵行 0 / PASS** |
+
+### 15.3 我改掉的 3 处**硬编码版本**（防复发）
+
+- `tools/expectations.mjs` 新增 **`asarVersionInfo()`**：动态读取运行中 asar 的 version / 前端资源名 / mtime。
+- `platform-modules-check.mjs`：原 INFO 行把 `0.2.0-rc.1` 与 `index-Dy0OhsZ5.js` 写死（升级后必然误报或静默降级）→ 改为动态，并**显式打印两源版本差异**。
+- `facts-check.mjs`：3 处标签原写死 `0.2.0-rc.1` → 改为 `${RUNNING.version}`（现输出 `运行中 0.2.0-rc.2`）。
+> 这正是 PLAN §10.17 那条教训的落地：**参照物（版本号、资源文件名）必须动态读取，不得硬编码**。
+
+### 15.4 T16 复核（★ 我在 rc.2 asar 上独立核对，全部证实）
+
+| lead 的声明 | 我的核对结果 |
+|---|---|
+| 服务名 `sessionController` | ✅ `super(ctx, "sessionController", { namespace: "session" })`（`dsh-api-session-controller/lib/index.js`） |
+| 宿主实现是 `async list(signal)` 且返回**裸数组** | ✅ `async list(signal) { … const items = []; … }` 返回数组；同文件另有 Remote 装饰形态 `async list(request, signal)`（即 `.d.ts` 的客户端/远端形态）→ **两种签名确实不同**，按宿主形态接线是对的 |
+| "running" 的判据 | ✅ `running: this.ctx.agents.get(session.id)?.status === "running"`；无 live 会话的行 `running: false`。即 **running 来自 agent 状态**，不是"被 DSH 加载/attached" |
+| 影响 | 此前用 `ctx.get('sessions')?.get(id)` 只判 attached，会把 **fork/rewind 自动归档的源会话**永久挡成 409；T16 换成 agent 状态后解除 |
+
+### 15.5 T17 复核（★ 源码级）
+
+- `resolveRowRunning(status, summaryRunning)`：**状态表优先、回退摘要**；`status` 存在但 `running === undefined`（未知）按**未运行**处理（对应"未知按可删"，不会一禁了之）。
+- `buildSectionModel` 内 `canRecycle = !running` 逐行派生；界面据此**在点击之前**禁用（T17 目的）。
+- **附带消除一个覆盖缺口**：T14 的 `buildSectionModel` 把"`/list` 条目 + workspace 快照 + 会话摘要 → 最终分组"抽成**纯函数**，因此我 §13.3 提的"这条链只能靠源码文本断言"现在**可以真执行覆盖**。
+- `error.session-live` 文案已改为同时覆盖两种拒绝原因（"仍在运行**或**被 DSH 加载"，`locales.ts:120/238`）✅。
+
+### 15.6 A1–A7 版本标注刷新：**rc.1 逐项定案 + rc.2 实机复核**
+
+| # | rc.1 定案（§14.4） | rc.2 复核 |
+|---|---|---|
+| A1 | 通过 | **维持**：rc.2 基座表 9 键一致、bundle 仍只 require 基座模块（白名单 PASS）、令牌 10/10 存在 |
+| A2 | 通过 | **维持**：数据源仍是官方 `archivedSessionIds`，快照字段未变 |
+| A3 | 通过 | **维持**：`unarchiveSession` 仍是官方接口 |
+| A4 | 通过 | **维持**：rc.2 真实校验器 4/4、`host-contract` 全绿、磁盘证据未变 |
+| A5 | 通过 | **维持**：rc.2 上幽灵行 0 |
+| A6 | 通过 | **维持**：rc.2 红线扫描 0 命中 |
+| A7 | 通过 | **维持**：rc.2 令牌存在性 10/10、词典/thunk 机制未变 |
+| —— | —— | **新增 rc.2 live 证据（○）**：用户在 rc.2 上打开设置页，并收到**本插件返回的 `409 session-live`（含我们的错误码与文案）** ⇒ 我们的 4 条路由、鉴权链路与错误契约在 **rc.2 上真实可用**（比静态分析更强的"插件在 rc.2 可用"证据） |
+
+**没有任何一项结论在 rc.2 上反转。**
+
+### 15.7 待重启后的关键活体复测点（T16 未 live）
+
+- 现状：进程 **18:47:41** < 构建 **20:47:36** ⇒ 宿主侧 T16 未生效。
+- 复测点（lead 指定）：**删除 fork / rewind 自动归档的源会话，不应再被 409 `session-live` 挡住**。
+- 我要求的原始证据：① fork/rewind 生成自动归档会话后，页面**不再**把它标成"运行中"（或标了也能删）；② 点删除返回 200 且 `recycle/<entryId>/` 出现；③ 若仍 409，把响应体（`code`/`message`/`ids`）原样给我。
+
+### 15.8 rc.2 上仍未覆盖的项
+
+1. T16 的 live 行为（待重启，见 §15.7）。
+2. A1 视觉 / A7 跟随仍为 ○（用户反馈，我未亲验像素）；回收站页签切换与清空确认弹窗交互只能人眼。
+3. P19 的"写台账失败 ∧ 回滚失败"双重故障真机无法制造（T13 已从设计兜住）。
+4. 若根台账损坏 ∧ 冷存档无台账 ∧ `batch.json` 也损坏 → 仍会漏报（三条 JSON 全坏；建议补"目录名 / `session/` 存在性"这类不依赖 JSON 的来源）。
+
+### 15.9 工具纪律（本轮踩到并已改）
+
+上一轮我用**嵌套引号的 PowerShell 一行命令**（`node -e "…[^"]+…"`）去读 asar，被 PS 解析器打挂、整轮作废。已改为：
+1. 优先写 `.mjs` 脚本或 `node -e`（整段**单引号**包裹、内部只用双引号）；
+2. 需要 asar 内容时用 `scripts/asar-read.mjs`（`find`/`cat`/`css`）或 `asar-probe.mjs`，**不做全量扫描**；
+3. 单条命令 **>60s 无输出即跳过**，写「未覆盖（原因：超时）」，不重试第三次；
+4. 继续**不用** client 侧 `cordis_inspect_query`（记忆 #0008：等页面响应会挂死）。

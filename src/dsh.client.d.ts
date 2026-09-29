@@ -52,6 +52,23 @@ interface DshSessionsSnapshot {
 /** standardProps 里的 store 钩子：传 selector 订阅，返回派生值。 */
 type DshStoreHook<T> = <R>(selector: (snapshot: T) => R) => R;
 
+/**
+ * 一条会话的运行状态（`useSessionStatus` 快照的 value）。
+ *
+ * 证据（本机 asar，官方产物）：
+ * - `dsh-client-ui-conversation/lib/client.js`：
+ *   `useSessionStatus((snapshot) => snapshot.get(sessionId)?.pendingInteraction)`
+ * - `dsh-client-ui-subagent/lib/client.js`：
+ *   `const statuses = useSessionStatus((value) => value);`
+ *   `(statuses.get(entry.id)?.running ?? summaries[entry.id]?.running) === true`
+ * → 快照是 `Map<SessionId, SessionStatus>`，`running` 可缺省（未知）。
+ */
+interface DshSessionStatus {
+	readonly running?: boolean;
+	/** 会话在等用户输入（官方 conversation 页用它）。 */
+	readonly pendingInteraction?: unknown;
+}
+
 /** 工作区客户端服务（只声明本插件用到的面）。 */
 interface DshWorkspacesService {
 	/**
@@ -76,6 +93,11 @@ interface DshSettingsSectionProps {
 	readonly useWorkspaces?: DshStoreHook<DshWorkspaceSnapshot>;
 	/** 会话摘要钩子。 */
 	readonly useSessions?: DshStoreHook<DshSessionsSnapshot>;
+	/**
+	 * 会话运行状态钩子（standardProps）。快照是 `Map<SessionId, DshSessionStatus>`。
+	 * 这是「运行中」的唯一官方实时信号，也是"点之前就能看见"的依据（T17）。
+	 */
+	readonly useSessionStatus?: DshStoreHook<ReadonlyMap<string, DshSessionStatus>>;
 	/** 由本插件注册时通过 `inject` 回填的官方工作区服务。 */
 	readonly workspaces?: DshWorkspacesService;
 	/**

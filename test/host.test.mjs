@@ -75,18 +75,35 @@ async function craftEntry(home, entryId, manifest, options = {}) {
 
 /**
  * 一个可控的假 Context，只实现本插件用到的最小面。
- * @param options.live 视为「正在运行」的会话 id 集合。
+ *
+ * T16 起「正在运行」与「被加载（attached）」是两个独立信号：
+ * @param options.live 简写：同时作为 attached 与 running 的集合（旧用例沿用）。
+ * @param options.attached `ctx.get('sessions').get(id)` 命中的集合（官方术语 live/attached）。
+ * @param options.running `sessionController.list()` 里 `running === true` 的集合。
+ * @param options.controller `'array'`（宿主真实形态，默认）| `'wrapped'`（`{items}` 客户端形态）
+ *   | `'missing'`（服务缺失）| `'throws'`（读取抛错）| `'timeout'`（超时中断）。
  * @param options.archived 官方 `workspaceRegistry.archivedSessionIds`（默认三个测试会话都算已归档）。
  * @param options.sessionsAvailable 为 false 时 `ctx.get('sessions')` 返回 undefined（模拟服务缺失）。
  * @param options.registryAvailable 为 false 时 `ctx.get('workspaceRegistry')` 返回 undefined。
  */
 function fakeContext(options = {}) {
-	const { live = new Set(), archived = [SESSION_A, SESSION_B, SESSION_C], sessionsAvailable = true, registryAvailable = true } = options;
+	const {
+		live = new Set(),
+		attached = live,
+		running = live,
+		controller = 'array',
+		archived = [SESSION_A, SESSION_B, SESSION_C],
+		sessionsAvailable = true,
+		registryAvailable = true
+	} = options;
 	const routes = new Map();
 	const disposers = [];
+	/** `sessionController.list()` 收到的 signal，供断言超时接线。 */
+	const probes = [];
 	return {
 		routes,
 		disposers,
+		probes,
 		ctx: {
 			connection: {
 				fetch: {
@@ -102,9 +119,26 @@ function fakeContext(options = {}) {
 			},
 			get(name) {
 				if (name === 'sessions') {
+					// `get(id)` = attached（live/attached，不等于正在运行）
 					return sessionsAvailable
-						? { get: (sessionId) => (live.has(sessionId) ? { id: sessionId } : undefined), list: () => [] }
+						? { get: (sessionId) => (attached.has(sessionId) ? { id: sessionId } : undefined), list: () => [] }
 						: undefined;
+				}
+				if (name === 'sessionController') {
+					if (controller === 'missing') return undefined;
+					return {
+						async list(signal) {
+							probes.push(signal);
+							if (controller === 'throws') throw new Error('sessionController.list failed');
+							if (controller === 'timeout') {
+								const abort = new Error('The operation was aborted due to timeout');
+								abort.name = 'TimeoutError';
+								throw abort;
+							}
+							const items = [...attached].map((sessionId) => ({ sessionId, running: running.has(sessionId), agentAvailable: true }));
+							return controller === 'wrapped' ? { items } : items;
+						}
+					};
 				}
 				if (name === 'workspaceRegistry') {
 					// 与官方一致：`archivedSessionIds` 是同步 getter（dsh-workspace/lib/index.js:504-505）
@@ -970,6 +1004,107 @@ test('端点：restore 运行中 → 409 session-live（与 recycle 对称，F4/
 		true,
 		'409 必须磁盘零改动'
 	);
+});
+
+test('端点（T16）recycle：running→409 / attached 空闲→成功 / 无法判定→拒绝 / cold→成功', async () => {
+	// ① running=true → 409 session-live，磁盘零改动
+	const homeRunning = await makeHome();
+	const originalRunning = await makeSession(homeRunning, SESSION_A);
+	const beforeRunning = await snapshot(homeRunning);
+	const fakeRunning = registerWithHome(homeRunning, { attached: new Set([SESSION_A]), running: new Set([SESSION_A]) });
+	const running = await callRoute(fakeRunning, HOST_ROUTES.recycle, { body: { sessionIds: [SESSION_A] } });
+	assert.equal(running.status, 409);
+	assert.equal(running.body.code, 'session-live');
+	assert.match(running.body.message, /会话正在运行/);
+	assert.deepEqual(running.body.ids, [SESSION_A]);
+	assert.equal(await snapshot(homeRunning), beforeRunning, '409 必须磁盘零改动');
+	assert.equal(existsSync(originalRunning), true);
+
+	// ② attached 但 running=false（用户 fork/rewind 后自动归档的场景）→ 放行
+	const homeIdle = await makeHome();
+	await makeSession(homeIdle, SESSION_A);
+	const fakeIdle = registerWithHome(homeIdle, { attached: new Set([SESSION_A]), running: new Set() });
+	const idle = await callRoute(fakeIdle, HOST_ROUTES.recycle, { body: { sessionIds: [SESSION_A] } });
+	assert.equal(idle.status, 200, 'attached 但确认未运行必须放行（这正是用户被卡住的场景）');
+	assert.deepEqual(idle.body, { moved: [SESSION_A], failed: [] });
+	assert.equal(fakeIdle.probes.length, 1, 'attached 时才去问 sessionController');
+	assert.ok(fakeIdle.probes[0] instanceof AbortSignal, '必须传 AbortSignal.timeout(...)');
+	assert.equal(fakeIdle.probes[0].aborted, false);
+
+	// ③ 无法判定：服务缺失 / 抛错 / 超时 → 一律拒绝（fail-safe）
+	const homeUnknown = await makeHome();
+	const originalUnknown = await makeSession(homeUnknown, SESSION_A);
+	const beforeUnknown = await snapshot(homeUnknown);
+	for (const controller of ['missing', 'throws', 'timeout']) {
+		const fake = registerWithHome(homeUnknown, { attached: new Set([SESSION_A]), controller });
+		const response = await callRoute(fake, HOST_ROUTES.recycle, { body: { sessionIds: [SESSION_A] } });
+		assert.equal(response.status, 409, `${controller}：无法判定必须拒绝`);
+		assert.equal(response.body.code, 'session-live');
+		assert.match(response.body.message, /无法确认/, controller);
+		assert.deepEqual(response.body.ids, [SESSION_A], controller);
+		assert.equal(await snapshot(homeUnknown), beforeUnknown, `${controller}：磁盘零改动`);
+	}
+	assert.equal(existsSync(originalUnknown), true);
+
+	// ④ cold（未 attached）→ 放行，且**不去问** sessionController（所以 controller 抛错也不影响）
+	const homeCold = await makeHome();
+	await makeSession(homeCold, SESSION_A);
+	const fakeCold = registerWithHome(homeCold, { attached: new Set(), controller: 'throws' });
+	const cold = await callRoute(fakeCold, HOST_ROUTES.recycle, { body: { sessionIds: [SESSION_A] } });
+	assert.equal(cold.status, 200, 'cold 会话不该因为 sessionController 不可用而被拒');
+	assert.deepEqual(cold.body, { moved: [SESSION_A], failed: [] });
+	assert.equal(fakeCold.probes.length, 0, 'cold 直接放行，不必试探');
+
+	// ⑤ `{ items }` 包裹形态也要能解析（客户端 Remote 形态，防御版本差异）
+	const homeWrapped = await makeHome();
+	await makeSession(homeWrapped, SESSION_A);
+	const fakeWrapped = registerWithHome(homeWrapped, { attached: new Set([SESSION_A]), running: new Set([SESSION_A]), controller: 'wrapped' });
+	const wrapped = await callRoute(fakeWrapped, HOST_ROUTES.recycle, { body: { sessionIds: [SESSION_A] } });
+	assert.equal(wrapped.status, 409);
+	assert.equal(wrapped.body.code, 'session-live');
+});
+
+test('端点（T16）restore：与 recycle 同一判据（running→409 / attached 空闲→成功 / 无法判定→拒绝 / cold→成功）', async () => {
+	const home = await makeHome();
+	await makeSession(home, SESSION_A);
+	await makeSession(home, SESSION_B, { slug: '--D-DSH--' });
+	await makeSession(home, SESSION_C, { slug: '--D-other--' });
+	// 用 cold 判据把三条都移进回收站（准备夹具）
+	const prepared = registerWithHome(home, { attached: new Set([SESSION_A]) });
+	for (const sessionId of [SESSION_A, SESSION_B, SESSION_C]) {
+		const moved = await callRoute(prepared, HOST_ROUTES.recycle, { body: { sessionIds: [sessionId] } });
+		assert.equal(moved.status, 200, `准备夹具失败：${sessionId}`);
+	}
+	const entries = new Map((await callRoute(prepared, HOST_ROUTES.list)).body.entries.map((entry) => [entry.sessionId, entry.entryId]));
+
+	// ① running → 409，载荷留在回收站
+	const fakeRunning = registerWithHome(home, { attached: new Set([SESSION_A]), running: new Set([SESSION_A]) });
+	const running = await callRoute(fakeRunning, HOST_ROUTES.restore, { body: { entryIds: [entries.get(SESSION_A)] } });
+	assert.equal(running.status, 409);
+	assert.equal(running.body.code, 'session-live');
+	assert.match(running.body.message, /会话正在运行/);
+	assert.equal(existsSync(join(home, 'archive-manager', 'recycle', entries.get(SESSION_A), 'session')), true);
+
+	// ② attached 但空闲 → 还原成功
+	const fakeIdle = registerWithHome(home, { attached: new Set([SESSION_B]), running: new Set() });
+	const idle = await callRoute(fakeIdle, HOST_ROUTES.restore, { body: { entryIds: [entries.get(SESSION_B)] } });
+	assert.equal(idle.status, 200);
+	assert.deepEqual(idle.body, { restored: [entries.get(SESSION_B)], failed: [] });
+	assert.equal(existsSync(join(home, 'sessions', '--D-DSH--', SESSION_B, 'session.v4.jsonl.zstd')), true);
+
+	// ③ 无法判定 → 409，载荷留在回收站
+	const fakeUnknown = registerWithHome(home, { attached: new Set([SESSION_C]), controller: 'throws' });
+	const unknown = await callRoute(fakeUnknown, HOST_ROUTES.restore, { body: { entryIds: [entries.get(SESSION_C)] } });
+	assert.equal(unknown.status, 409);
+	assert.match(unknown.body.message, /无法确认/);
+	assert.equal(existsSync(join(home, 'archive-manager', 'recycle', entries.get(SESSION_C), 'session')), true);
+
+	// ④ cold → 还原成功
+	const fakeCold = registerWithHome(home, { attached: new Set(), controller: 'throws' });
+	const cold = await callRoute(fakeCold, HOST_ROUTES.restore, { body: { entryIds: [entries.get(SESSION_C)] } });
+	assert.equal(cold.status, 200);
+	assert.deepEqual(cold.body, { restored: [entries.get(SESSION_C)], failed: [] });
+	assert.equal(existsSync(join(home, 'sessions', '--D-other--', SESSION_C, 'session.v4.jsonl.zstd')), true);
 });
 
 test('红线守卫：构建产物里没有任何物理删除语义的调用', async () => {

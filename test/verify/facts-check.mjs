@@ -10,9 +10,11 @@
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ASAR_PATH, NPM_DSH_PACKAGES, DELETE_API_PATTERNS, discoverNpmFrontend } from './tools/expectations.mjs';
+import { ASAR_PATH, NPM_DSH_PACKAGES, DELETE_API_PATTERNS, asarVersionInfo, discoverNpmFrontend } from './tools/expectations.mjs';
 
 const PLAN_PATH = fileURLToPath(new URL('../../PLAN.md', import.meta.url));
+/** 运行中 asar 的版本/资源名 —— **动态读取**（本会话内 rc.1 → rc.2 自动升级过一次）。 */
+const RUNNING = asarVersionInfo() ?? { version: 'unknown', asset: undefined, mtimeIso: 'unknown', asarPath: ASAR_PATH };
 /** 参照树（profile 安装）的 dsh 元包版本；本会话期间由 0.1.7-rc.2 升到 0.2.0-rc.1，故动态读取而非硬编码。 */
 const TREE_VERSION = (() => {
 	try {
@@ -41,13 +43,13 @@ const slice = (file, from, to) => lines(file).slice(from - 1, to).join('\n');
 		record(ok ? 'PASS' : 'MISMATCH', 'PLAN 10.1：`dsh-host-webserver/lib/index.js:322-332` = 精确表优先、其后最长前缀优先',
 			ok ? `第 322 行注释命中；324-331 行为 exact.get(pathname) + prefix.length 比较\n${body}` : `行 322-332 与描述不符：\n${body}`);
 	}
-	// 同款代码在运行中 GUI（0.2.0-rc.1）
-	if (!existsSync(ASAR_PATH)) record('INCONCLUSIVE', 'host-webserver match() @0.2.0-rc.1', 'asar 不存在');
+	// 同款代码在运行中 GUI（版本动态读取：本会话内 rc.1 → rc.2 自动升级过）
+	if (!existsSync(ASAR_PATH)) record('INCONCLUSIVE', `host-webserver match() @${RUNNING.version}`, 'asar 不存在');
 	else {
 		const source = readFileSync(ASAR_PATH).toString('latin1');
 		const ok = source.includes('Longest-prefix-wins over the prefix table after an exact-table miss') && source.includes('prefix.length > best.path.length');
-		record(ok ? 'PASS' : 'MISMATCH', '运行中 0.2.0-rc.1 的 match() 语义相同（跨版本一致性）',
-			ok ? `asar 内在 byte ${source.indexOf('Longest-prefix-wins')} 处命中同一实现` : 'asar 内未命中同款实现');
+		record(ok ? 'PASS' : 'MISMATCH', `运行中 ${RUNNING.version} 的 match() 语义相同（跨版本一致性）`,
+			ok ? `asar（${RUNNING.version}, mtime ${RUNNING.mtimeIso}）在 byte ${source.indexOf('Longest-prefix-wins')} 处命中同一实现` : 'asar 内未命中同款实现');
 	}
 }
 
@@ -81,9 +83,9 @@ const slice = (file, from, to) => lines(file).slice(from - 1, to).join('\n');
 	}
 }
 
-// ---------- 4. 信封 + 基座表（运行中 0.2.0-rc.1） ----------
+// ---------- 4. 信封 + 基座表（运行中 asar，版本动态读取） ----------
 {
-	if (!existsSync(ASAR_PATH)) record('INCONCLUSIVE', 'bundle 信封 @0.2.0-rc.1', 'asar 不存在');
+	if (!existsSync(ASAR_PATH)) record('INCONCLUSIVE', `bundle 信封 @${RUNNING.version}`, 'asar 不存在');
 	else {
 		const source = readFileSync(ASAR_PATH).toString('latin1');
 		const envelope = source.split('window.__ModuleLoader__.load({').length - 1;
@@ -97,9 +99,9 @@ const slice = (file, from, to) => lines(file).slice(from - 1, to).join('\n');
 		const planCitesNpm = planText.includes(npmAssetName);
 		const npmLabeled = /0\.1\.7/.test(planText);
 		record(planCitesReal ? 'PASS' : 'MISMATCH',
-			'PLAN 10.1：基座表来源文件名必须与运行中 0.2.0-rc.1 的真实资源一致',
-			`asar 内真实资源=${realAsset}（由 asar 中 assets/index-*.js 解析）；PLAN 是否引用它=${planCitesReal}；` +
-				`PLAN 是否也提到 npm 版 ${npmAssetName}=${planCitesNpm}（提到时须标注 0.1.7：${npmLabeled}）。` +
+			`PLAN 10.1：基座表来源文件名必须与运行中 ${RUNNING.version} 的真实资源一致`,
+			`运行中 asar=${RUNNING.version}（mtime ${RUNNING.mtimeIso}）内真实资源=${realAsset}（由 asar 中 assets/index-*.js 动态解析）；PLAN 是否引用它=${planCitesReal}；` +
+				`参照树版 ${npmAssetName}=${planCitesNpm}（提到时须标注其版本：${npmLabeled}）。` +
 				'两源解析出的 9 键基座表一致，见 platform-modules-check.mjs。');
 	}
 }
@@ -146,7 +148,7 @@ const slice = (file, from, to) => lines(file).slice(from - 1, to).join('\n');
 		`PLAN 2.2：参照树（@deepseek-ai/dsh@${TREE_VERSION}）全量 *.d.ts 无**公开** deleteSession/removeSession/purgeSession`,
 		`扫描 ${scanned} 个 .d.ts（树版本 ${TREE_VERSION}；本会话期间该树已由 0.1.7-rc.2 升到 0.2.0-rc.1，即与运行中宿主同版本 → 该结论比原先更强）；公开命中 ${hits.length} 条；下划线私有命中 ${privateHits.length} 条\n${hits.join('\n')}${privateHits.length ? `\n私有（不算公开接口）：\n${privateHits.join('\n')}` : ''}`);
 
-	// 5b. 运行中 0.2.0-rc.1 asar
+	// 5b. 运行中 asar（版本动态读取）
 	if (existsSync(ASAR_PATH)) {
 		const source = readFileSync(ASAR_PATH).toString('latin1');
 		const counts = {};
@@ -155,11 +157,11 @@ const slice = (file, from, to) => lines(file).slice(from - 1, to).join('\n');
 		}
 		const agentProtocol = source.includes('session_delete: "session/delete"') && source.includes('sessionCapabilities.delete');
 		record(counts.removeSession === 0 && counts.purgeSession === 0 && counts['unarchive-sessions'] === 0 ? 'PASS' : 'MISMATCH',
-			'PLAN 2.2：运行中 0.2.0-rc.1 无 removeSession/purgeSession，且无官方 unarchive-sessions 设置页',
+			`PLAN 2.2：运行中 ${RUNNING.version} 无 removeSession/purgeSession，且无官方 unarchive-sessions 设置页`,
 			`出现次数 ${JSON.stringify(counts)}`);
 		record('INFO',
 			'PLAN 2.2 措辞「删除会话 ❌ 完全不存在」需限定范围（重要反例）',
-			`0.2.0-rc.1 asar 内 deleteSession 命中 ${counts.deleteSession} 次，全部属 **Agent 协议**层：` +
+			`${RUNNING.version} asar（mtime ${RUNNING.mtimeIso}）内 deleteSession 命中 ${counts.deleteSession} 次，全部属 **Agent 协议**层：` +
 				`AGENT_METHODS.session_delete === "session/delete"（agentCapabilities=${agentProtocol}），用于请求外部 agent 删除其 session/list 中的会话；` +
 				`另有下划线私有 _deleteSession(${counts._deleteSession} 次) 属 sqlite 搜索索引行删除。` +
 				'→ 结论「DSH 自身工作区/转录存储没有删除接口」成立；但「全仓完全不存在该标识符」不成立。');

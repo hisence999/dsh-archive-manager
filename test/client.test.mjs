@@ -993,3 +993,123 @@ test('T15 页签仍是组件内部 state（测试缝只当初值，没有变成�
 	assert.ok(source.includes("props.initialRecycleEntries === undefined ? undefined : { initialEntries: props.initialRecycleEntries }"),
 		'回收站预置条目走 useRecycleBin 的测试缝');
 });
+
+// ---------------------------------------------------------------------------
+// T17：把「运行中」在点击之前标出来
+// ---------------------------------------------------------------------------
+
+test('T17 resolveRowRunning：状态优先、缺失回退摘要、状态存在但 running 未知按未运行', () => {
+	assert.equal(model.resolveRowRunning({ running: true }, false), true);
+	// 状态表里有这条就信它（可以覆盖摘要里的旧值）。
+	assert.equal(model.resolveRowRunning({ running: false }, true), false);
+	// 未知 → 按可删，不因为状态未知就禁用一切（要求 3）。
+	assert.equal(model.resolveRowRunning({ running: undefined }, true), false);
+	assert.equal(model.resolveRowRunning({}, true), false);
+	// 状态表里没有这条 → 回退会话摘要。
+	assert.equal(model.resolveRowRunning(undefined, true), true);
+	assert.equal(model.resolveRowRunning(undefined, false), false);
+});
+
+test('T17 模型：running 的行被标记且不可回收，其余可回收（与幽灵行过滤/分组组合正确）', () => {
+	const statuses = new Map([
+		[E2E.alpha1, { running: true }],
+		[E2E.beta1, { running: undefined }]
+	]);
+	const view = model.buildSectionModel({
+		workspace: e2eSnapshot,
+		sessions: e2eSessions,
+		recycleEntries: bin.parseRecycleEntries(e2eListBody),
+		optimisticGone: [],
+		sessionStatus: statuses,
+		query: '',
+		sortKey: 'updatedAt',
+		selectedIds: []
+	});
+	const rows = new Map(view.alive.map((row) => [row.id, row]));
+
+	assert.equal(rows.get(E2E.alpha1).running, true, '状态 running:true → 行被标记');
+	assert.equal(rows.get(E2E.alpha1).canRecycle, false, '状态 running:true → 不可移入回收站（按钮禁用）');
+	assert.equal(rows.get(E2E.alpha2).running, false);
+	assert.equal(rows.get(E2E.alpha2).canRecycle, true, '状态表里没有它且摘要也没有 → 可删');
+	assert.equal(rows.get(E2E.beta1).running, false, 'running:undefined → 按未运行');
+	assert.equal(rows.get(E2E.beta1).canRecycle, true, '未知状态不得禁用');
+
+	// 既有行为不回退：幽灵行过滤、分组、组内计数都不受影响。
+	assert.equal(view.alive.some((row) => row.id === E2E.ghost), false);
+	assert.deepEqual(view.groups.map((group) => [group.id, group.rows.length]), [['ws-a', 2], ['ws-b', 1]]);
+	// 运行中的行仍然可见、可被选中、可被搜索（只是不可删）。
+	assert.ok(view.listedIds.includes(E2E.alpha1));
+	const searched = model.buildSectionModel({
+		workspace: e2eSnapshot,
+		sessions: e2eSessions,
+		recycleEntries: [],
+		optimisticGone: [],
+		sessionStatus: statuses,
+		query: 'Alpha 一',
+		sortKey: 'updatedAt',
+		selectedIds: [E2E.alpha1]
+	});
+	assert.deepEqual(searched.listedIds, [E2E.alpha1]);
+	assert.deepEqual(searched.selected, [E2E.alpha1]);
+	assert.equal(searched.allSelected, true);
+	assert.equal(searched.alive.find((row) => row.id === E2E.alpha1).canRecycle, false, '搜索不改变可删性');
+});
+
+test('T17 模型：状态表缺失时回退会话摘要的 running', () => {
+	const view = model.buildSectionModel({
+		workspace: e2eSnapshot,
+		sessions: { byId: { ...e2eSessions.byId, [E2E.alpha2]: { ...e2eSessions.byId[E2E.alpha2], running: true } } },
+		recycleEntries: [],
+		optimisticGone: [],
+		query: '',
+		sortKey: 'updatedAt',
+		selectedIds: []
+	});
+	const rows = new Map(view.alive.map((row) => [row.id, row]));
+	assert.equal(rows.get(E2E.alpha2).running, true);
+	assert.equal(rows.get(E2E.alpha2).canRecycle, false);
+	assert.equal(rows.get(E2E.alpha1).canRecycle, true);
+});
+
+test('T17 回收站：运行中的条目不可还原（宿主同样拒绝 restore），purged 的原因优先', () => {
+	const purgedGhost = {
+		entryId: `1790673301827@${E2E.ghost}`,
+		sessionId: E2E.ghost,
+		movedAt: '2026-09-29T09:31:38.509Z',
+		originalPath: `D:\\x\\${E2E.ghost}`,
+		bytes: 1,
+		purgedAt: '2026-09-29T09:31:38.509Z',
+		purgedBatch: 'b1'
+	};
+	const entries = bin.parseRecycleEntries({
+		entries: [entry(E2E.alpha1), entry(E2E.beta1), purgedGhost]
+	});
+	const view = binView({
+		entries,
+		sessionStatus: new Map([[E2E.alpha1, { running: true }], [E2E.ghost, { running: true }]])
+	});
+	const bySession = new Map(view.recycleRows.map((row) => [row.entry.sessionId, row]));
+
+	assert.equal(bySession.get(E2E.alpha1).running, true);
+	assert.equal(bySession.get(E2E.alpha1).canRestore, false, '运行中的条目不可还原');
+	assert.equal(bySession.get(E2E.alpha1).reasonKey, 'error.session-live');
+	assert.equal(bySession.get(E2E.beta1).canRestore, true);
+	assert.equal(bySession.get(E2E.beta1).reasonKey, '');
+	// 既已移交冷存档区、又在运行 → 原因取 purged（那是更根本的阻碍）。
+	assert.equal(bySession.get(E2E.ghost).canRestore, false);
+	assert.equal(bySession.get(E2E.ghost).reasonKey, 'error.entry-purged');
+});
+
+test('T17 文案：error.session-live 同时覆盖「仍在运行」与「被 DSH 加载」，新 aria 文案中英齐备', () => {
+	assert.ok(locales.LOCALE_ZH['error.session-live'].includes('仍在运行'));
+	assert.ok(locales.LOCALE_ZH['error.session-live'].includes('被 DSH 加载'));
+	assert.ok(locales.LOCALE_EN['error.session-live'].includes('still running'));
+	assert.ok(locales.LOCALE_EN['error.session-live'].includes('loaded by DSH'));
+	for (const key of ['row.delete.running', 'row.delete.running.aria', 'recycle.restore.running.aria']) {
+		assert.equal(typeof locales.LOCALE_ZH[key], 'string', `中文缺文案：${key}`);
+		assert.equal(typeof locales.LOCALE_EN[key], 'string', `英文缺文案：${key}`);
+	}
+	// 「运行中」标签沿用已有 key。
+	assert.equal(locales.LOCALE_ZH['row.running'], '运行中');
+	assert.equal(locales.LOCALE_EN['row.running'], 'Running');
+});

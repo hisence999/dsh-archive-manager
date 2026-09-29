@@ -58,7 +58,7 @@ import {
 	useArchivedSessions
 } from './useArchivedSessions.js';
 import type { ApiFailure, ArchivedGroup, ArchivedRow, SectionTab, SortKey } from './useArchivedSessions.js';
-import { isPurgedEntry, parsePurgeOutcome, parseRestoreOutcome, restoreGuard, useRecycleBin } from './useRecycleBin.js';
+import { parsePurgeOutcome, parseRestoreOutcome, restoreGuard, useRecycleBin } from './useRecycleBin.js';
 
 /** 一次操作的提示。 */
 interface Notice {
@@ -243,10 +243,15 @@ function movedAtMs(entry: RecycleEntry): number | null {
 	return Number.isNaN(parsed) ? null : parsed;
 }
 
+/** 稳定的 selector（模块级常量，避免每次渲染重新订阅会话状态）。 */
+const selectSessionStatus = (
+	snapshot: ReadonlyMap<string, DshSessionStatus>
+): ReadonlyMap<string, DshSessionStatus> => snapshot;
+
 /**
  * 设置页组件。
- * @param props - ownerProps（`close`）+ standardProps（`useWorkspaces` / `useSessions` / `t`）
- *   以及本插件通过 `inject` 回填的 `workspaces`。
+ * @param props - ownerProps（`close`）+ standardProps（`useWorkspaces` / `useSessions` /
+ *   `useSessionStatus` / `t`）以及本插件通过 `inject` 回填的 `workspaces`。
  */
 export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Element {
 	const t = useMemo(() => createTranslate(props.t, undefined), [props.t]);
@@ -264,16 +269,22 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 	const [purgeOpen, setPurgeOpen] = useState(false);
 	const [purgeAcknowledged, setPurgeAcknowledged] = useState(false);
 
-	// 先订阅回收站清单，再让 hook 调用**唯一**的纯派生函数 buildSectionModel（T14）：
+	// 先订阅回收站清单与会话状态，再让 hook 调用**唯一**的纯派生函数 buildSectionModel（T14/T17）：
 	// 组件、hook、测试走的是同一条派生路径。
 	const bin = useRecycleBin(
 		props.initialRecycleEntries === undefined ? undefined : { initialEntries: props.initialRecycleEntries }
 	);
+	// 官方 standardProps：会话运行状态快照（`Map<SessionId, SessionStatus>`）。
+	// 与 useWorkspaces 同理，props 上的钩子在同一挂载期内是同一个函数，分支稳定。
+	const statuses = props.useSessionStatus === undefined
+		? undefined
+		: props.useSessionStatus(selectSessionStatus);
 	const model = useArchivedSessions(
 		props,
 		{
 			recycleEntries: bin.entries,
 			optimisticGone: locallyGone,
+			sessionStatus: statuses,
 			query,
 			sortKey,
 			selectedIds: selected
@@ -465,7 +476,7 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 						{showCwd ? <span>·</span> : null}
 						<span>{timeText(row.updatedAtMs, t)}</span>
 						{row.missingSummary ? <Pill>{t('row.summaryMissing')}</Pill> : null}
-						{row.running ? <Pill>{t('row.running')}</Pill> : null}
+						{row.running ? <Tag tone="info">{t('row.running')}</Tag> : null}
 					</div>
 				</div>
 				<div style={styles.rowActions}>
@@ -479,16 +490,21 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 							onClick={() => void restore([row.id])}
 						/>
 					</Tooltip>
-					<Tooltip label={t('row.delete')}>
-						<Button
-							variant="ghost"
-							size="sm"
-							style={styles.dangerText}
-							icon={<IconTrashOutlineRegular />}
-							disabled={busy}
-							aria-label={t('row.delete.aria', { title })}
-							onClick={() => setPending({ kind: 'recycle', ids: [row.id] })}
-						/>
+					{/* 运行中：**点之前**就禁用「移入回收站」并说明原因（T17）。 */}
+					<Tooltip label={row.running ? t('row.delete.running') : t('row.delete')}>
+						<span style={styles.tooltipAnchor}>
+							<Button
+								variant="ghost"
+								size="sm"
+								style={styles.dangerText}
+								icon={<IconTrashOutlineRegular />}
+								disabled={busy || !row.canRecycle}
+								aria-label={row.running
+									? t('row.delete.running.aria', { title })
+									: t('row.delete.aria', { title })}
+								onClick={() => setPending({ kind: 'recycle', ids: [row.id] })}
+							/>
+						</span>
 					</Tooltip>
 				</div>
 			</li>
@@ -572,10 +588,10 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 	};
 
 	const renderRecycle = (): JSX.Element => {
-		if (bin.phase === 'loading' && bin.entries.length === 0) {
+		if (bin.phase === 'loading' && model.recycleRows.length === 0) {
 			return <div style={styles.state}>{t('state.loading')}</div>;
 		}
-		if (bin.phase === 'error' && bin.entries.length === 0) {
+		if (bin.phase === 'error' && model.recycleRows.length === 0) {
 			return (
 				<div style={styles.state}>
 					<div style={{ color: token.labelError }}>{t('recycle.error.title')}</div>
@@ -585,18 +601,19 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 				</div>
 			);
 		}
-		if (bin.entries.length === 0) {
+		if (model.recycleRows.length === 0) {
 			return <div style={styles.state}>{t('recycle.empty')}</div>;
 		}
 		return (
 			<div>
 				<ul style={styles.list}>
-					{bin.entries.map((entry) => {
+					{/* 逐条判定（purged / running / canRestore）全部来自模型，UI 只做映射。 */}
+					{model.recycleRows.map((row) => {
+						const entry = row.entry;
 						const title = entry.title !== undefined && entry.title.length > 0
 							? entry.title
 							: t('recycle.entryUntitled');
-						// T12：有 purgedAt 的条目载荷已移交冷存档区，不可还原。
-						const purged = isPurgedEntry(entry);
+						const reason = row.reasonKey.length > 0 ? t(row.reasonKey) : t('recycle.restore');
 						return (
 							<li key={entry.entryId} style={styles.row}>
 								<div style={styles.rowMain}>
@@ -610,9 +627,10 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 										<span>·</span>
 										<span>{timeText(movedAtMs(entry), t)}</span>
 										<Pill>{fileSizeText(entry.bytes)}</Pill>
-										{purged ? <Tag tone="neutral">{t('recycle.purgedTag')}</Tag> : null}
+										{row.purged ? <Tag tone="neutral">{t('recycle.purgedTag')}</Tag> : null}
+										{row.running ? <Tag tone="info">{t('row.running')}</Tag> : null}
 									</div>
-									{purged ? (
+									{row.purged ? (
 										<div style={styles.rowMeta}>
 											{entry.purgedBatch !== undefined && entry.purgedBatch.length > 0
 												? t('recycle.purgedHint', { batch: entry.purgedBatch })
@@ -621,17 +639,19 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 									) : null}
 								</div>
 								<div style={styles.rowActions}>
-									<Tooltip label={purged ? t('error.entry-purged') : t('recycle.restore')}>
+									<Tooltip label={reason}>
 										{/* 包一层 span：原生 disabled 按钮不派发鼠标事件，提示会挂不上。 */}
 										<span style={styles.tooltipAnchor}>
 											<Button
 												variant="ghost"
 												size="sm"
 												icon={<IconUnarchiveOutlineRegular />}
-												disabled={busy || purged}
-												aria-label={purged
+												disabled={busy || !row.canRestore}
+												aria-label={row.purged
 													? t('recycle.restore.disabled.aria', { title })
-													: t('recycle.restore.aria', { title })}
+													: row.running
+														? t('recycle.restore.running.aria', { title })
+														: t('recycle.restore.aria', { title })}
 												onClick={() => void restoreEntry(entry)}
 											/>
 										</span>
@@ -678,12 +698,12 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 			},
 			{
 				value: 'recycle' as const,
-				label: t('tab.recycle', { count: bin.entries.length }),
+				label: t('tab.recycle', { count: model.recycleRows.length }),
 				id: 'archive-manager-tab-recycle',
 				panelId: 'archive-manager-panel-recycle'
 			}
 		],
-		[t, model.alive.length, bin.entries.length]
+		[t, model.alive.length, model.recycleRows.length]
 	);
 
 	const dialogTitle = pending?.kind === 'restore' ? t('confirmRestore.title') : t('confirm.title');
@@ -834,7 +854,7 @@ export function ArchivedSessionsSection(props: DshSettingsSectionProps): JSX.Ele
 			<RiskConfirmation
 				open={purgeOpen}
 				title={t('recycle.purge.title')}
-				description={t('recycle.purge.body', { count: bin.entries.length })}
+				description={t('recycle.purge.body', { count: model.recycleRows.length })}
 				acknowledgeLabel={t('recycle.purge.ack')}
 				cancelLabel={t('recycle.purge.cancel')}
 				closeLabel={t('recycle.purge.close')}

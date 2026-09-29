@@ -30,7 +30,14 @@ export interface ArchivedRow {
 	readonly cwd: string;
 	/** 更新时间（毫秒）；无法解析时为 `null`。 */
 	readonly updatedAtMs: number | null;
+	/** 现在是否正在跑 Agent（由 {@link buildSectionModel} 依据官方 `useSessionStatus` 填充）。 */
 	readonly running: boolean;
+	/**
+	 * 是否允许「移入回收站」。
+	 * 运行中的会话不允许（宿主会 409 `session-live`），所以要**在点击之前**就禁用（T17）。
+	 * 由 {@link buildSectionModel} 与 `running` 一起填充。
+	 */
+	readonly canRecycle: boolean;
 	/** 摘要缺失（归档集合里有 id，但 `useSessions().byId` 没有它）。 */
 	readonly missingSummary: boolean;
 }
@@ -64,7 +71,9 @@ export function rowFor(id: string, summary: DshSessionSummary | undefined): Arch
 		title,
 		cwd,
 		updatedAtMs: toEpochMs(summary?.updatedAt ?? summary?.createdAt),
+		// 这里只给"摘要口径"的初值；buildSectionModel 会用官方 useSessionStatus 覆盖 running/canRecycle。
 		running: summary?.running === true,
+		canRecycle: true,
 		missingSummary: summary === undefined
 	};
 }
@@ -556,6 +565,11 @@ export interface SectionViewInput {
 	readonly recycleEntries: readonly RecycleEntry[];
 	/** 删除/恢复成功后的本地乐观隐藏（下一次成功刷新后由清单接管）。 */
 	readonly optimisticGone: readonly string[];
+	/**
+	 * 官方 `useSessionStatus` 快照（`Map<SessionId, SessionStatus>`）。
+	 * 「运行中」的唯一实时信号；缺失时回退到会话摘要的 `running`（官方同款组合口径）。
+	 */
+	readonly sessionStatus?: ReadonlyMap<string, { readonly running?: boolean }> | undefined;
 	readonly query: string;
 	readonly sortKey: SortKey;
 	readonly direction?: SortDirection;
@@ -572,8 +586,27 @@ export interface ArchivedSectionInput extends SectionViewInput {
 export interface RecycleRow {
 	readonly entry: RecycleEntry;
 	readonly purged: boolean;
+	/** 该会话现在正在跑 Agent（`useSessionStatus`）。 */
+	readonly running: boolean;
 	readonly canRestore: boolean;
 	readonly reasonKey: string;
+}
+
+/**
+ * 判定一行是否「运行中」（T17）。
+ *
+ * 口径与官方一致、但更保守一点点：
+ * - 官方 `dsh-client-ui-subagent` 写的是 `statuses.get(id)?.running ?? summaries[id]?.running`；
+ * - 这里改成「**状态表里有这条就信它**，没有才回退摘要」——差别只在
+ *   `status` 存在但 `running === undefined`（未知）时按**未运行**处理，
+ *   对应 T17 要求 3「未知按可删」，不会因为状态未知就禁用一切。
+ */
+export function resolveRowRunning(
+	status: { readonly running?: boolean } | undefined,
+	summaryRunning: boolean
+): boolean {
+	if (status !== undefined) return status.running === true;
+	return summaryRunning === true;
 }
 
 /**
@@ -591,9 +624,18 @@ export interface RecycleRow {
 export function buildSectionModel(input: ArchivedSectionInput): ArchivedSectionModel {
 	const workspace = input.workspace;
 	const phase = resolvePhase(workspace);
-	const rows = workspace === undefined
+	const statuses = input.sessionStatus;
+	// 「运行中」是**官方实时信号优先**的判定，逐行解析（T17）。对象引用不变时不重建行，便于 memo。
+	const withRunning = (row: ArchivedRow): ArchivedRow => {
+		const running = resolveRowRunning(statuses?.get(row.id), row.running);
+		const canRecycle = !running;
+		return running === row.running && canRecycle === row.canRecycle
+			? row
+			: { ...row, running, canRecycle };
+	};
+	const rows = (workspace === undefined
 		? []
-		: buildRows(workspace.archivedSessionIds, input.sessions?.byId);
+		: buildRows(workspace.archivedSessionIds, input.sessions?.byId)).map(withRunning);
 	const workspaces: readonly unknown[] = workspace !== undefined && Array.isArray(workspace.items)
 		? workspace.items
 		: [];
@@ -612,7 +654,13 @@ export function buildSectionModel(input: ArchivedSectionInput): ArchivedSectionM
 
 	const recycleRows: RecycleRow[] = input.recycleEntries.map((entry) => {
 		const guard = restoreGuard(entry);
-		return { entry, purged: guard.purged, canRestore: guard.allowed, reasonKey: guard.reasonKey };
+		// 宿主对「运行中」的条目同样拒绝 restore（T6 的 F4），所以这里一并禁用并给出对应原因。
+		const running = resolveRowRunning(statuses?.get(entry.sessionId), false);
+		const canRestore = guard.allowed && !running;
+		const reasonKey = guard.allowed
+			? (running ? 'error.session-live' : '')
+			: guard.reasonKey;
+		return { entry, purged: guard.purged, running, canRestore, reasonKey };
 	});
 
 	return {

@@ -11,11 +11,32 @@
  *   因此该树**不再**是"低版本参照"，而是**另一套安装的同版本交叉验证源**；
  *   凡涉及运行中宿主行为的结论仍以 asar 为准。
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 
 export const ASAR_PATH = 'E:/DSH/resources/app.asar';
 export const NPM_DSH_PACKAGES = 'D:/DSH/dsh-home/profiles/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
 export const NPM_FRONTEND_DIR = `${NPM_DSH_PACKAGES}/dsh-web-frontend/dist/assets`;
+
+/**
+ * **动态读取运行中 asar 的版本与前端资源名**（不得硬编码版本号或 hash）。
+ *
+ * 起因：本会话里运行中的宿主从 **0.2.0-rc.1 自动升级到 0.2.0-rc.2**，
+ * 前端资源也从 `index-Dy0OhsZ5.js` 变成 `index-5SrrfWpU.js`；
+ * 任何把版本号/文件名写死的断言都会在升级后要么误报、要么静默降级。
+ * @returns 版本信息，或 `undefined`（asar 不存在时）。
+ */
+export function asarVersionInfo() {
+	if (!existsSync(ASAR_PATH)) return undefined;
+	const source = readFileSync(ASAR_PATH).toString('latin1');
+	const versionMatch = source.match(/"@deepseek-ai\/dsh-desktop-runtime"[\s\S]{0,240}?"version":\s*"([^"]+)"/);
+	const assetMatch = source.match(/assets\/(index-[A-Za-z0-9_-]+\.js)/);
+	return {
+		asarPath: ASAR_PATH,
+		version: versionMatch?.[1] ?? 'unknown',
+		asset: assetMatch?.[1] ?? undefined,
+		mtimeIso: statSync(ASAR_PATH).mtime.toISOString()
+	};
+}
 
 /**
  * **动态发现**参照树的前端 index bundle（不要硬编码 hash：本会话里该文件名已变过一次，

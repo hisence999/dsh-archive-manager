@@ -19,7 +19,7 @@
  * 用法：node test/verify/platform-modules-check.mjs [--asar <path>] [--npm <path>]
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { ASAR_PATH, NPM_FRONTEND_DIR, PLATFORM_MODULES as DECLARED, discoverNpmFrontend } from './tools/expectations.mjs';
+import { ASAR_PATH, NPM_FRONTEND_DIR, PLATFORM_MODULES as DECLARED, asarVersionInfo, discoverNpmFrontend } from './tools/expectations.mjs';
 
 const args = process.argv.slice(2);
 function argOf(name, fallback) {
@@ -81,18 +81,25 @@ function compare(label, keys, evidence) {
 	if (!same) failed = true;
 }
 
-// --- 运行中的 GUI（0.2.0-rc.1）---
+// --- 运行中的 GUI（**版本动态读取**，不硬编码：本会话内已从 rc.1 自动升级到 rc.2）---
 if (!existsSync(ASAR)) {
 	reports.push(`未覆盖 运行中 GUI 基座表：asar 不存在 ${ASAR}`);
 	failed = true;
 } else {
+	const running = asarVersionInfo();
 	const source = readFileSync(ASAR).toString('latin1');
-	const version = source.includes('"version": "0.2.0-rc.1"');
-	const asset = source.includes('assets/index-Dy0OhsZ5.js');
-	const assetCited = source.includes('assets/index-Q6zc2uHV.js');
-	reports.push(`INFO asar 版本串 0.2.0-rc.1=${version}；真实前端资源 index-Dy0OhsZ5.js=${asset}；PLAN 引用的 index-Q6zc2uHV.js=${assetCited}`);
+	reports.push(
+		`INFO 运行中 asar：version=${running?.version}  mtime=${running?.mtimeIso}  真实前端资源=${running?.asset}；` +
+			`参照树 version=${npmFrontend?.version ?? 'unknown'}  资源=${npmFrontend?.index ?? '?'}`
+	);
+	if (running?.version !== npmFrontend?.version) {
+		reports.push(
+			`INFO 两源版本**不同**（运行中 ${running?.version} vs 参照树 ${npmFrontend?.version}）——` +
+				'基座表比对仍是有效的跨版本交叉验证；凡是"运行中宿主行为"的结论一律以 asar 为准。'
+		);
+	}
 	const { keys, reason, literal } = extractSeedKeys(source);
-	compare('运行中 GUI 基座表', keys ?? null, { reason, literal: (literal ?? '').slice(0, 400), source: `${ASAR}（latin1 解析）` });
+	compare(`运行中 GUI（${running?.version}）基座表`, keys ?? null, { reason, literal: (literal ?? '').slice(0, 400), source: `${ASAR}（latin1 解析）` });
 }
 
 // --- 参照树前端（本次会话期间已升到 0.2.0-rc.1；与 asar 是**两套安装**的同版本交叉验证）---

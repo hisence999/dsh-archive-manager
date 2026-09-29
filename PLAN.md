@@ -360,12 +360,16 @@ const sessions = useSessions()                            // 摘要 byId
   并已通知 client-page **不要 import 非基座模块**（`@deepseek-ai/dsh-client-locale` 等
   属于非基座），改为通过 **Cordis 服务注入**（`export const inject = ['slots','locale']`）
   使用 `ctx.locale` / `ctx.slots`，无需任何模块导入。
-- **P2（verifier 发现，已修正）**：基座表在**运行中 asar** 里的真实来源文件是
-  `dsh-web-frontend/dist/assets/index-Dy0OhsZ5.js`；本计划初版引用的
-  `index-Q6zc2uHV.js` **只存在于 npm 0.1.7 安装**。两者解析出的 9 键基座表完全一致，
-  属证据跨版本错位。
-- **不再安装 `@deepseek-ai/*` 类型包**：本机 GUI 是桌面端内置 0.2.0-rc.1，而 npm 上最新只有
-  0.1.7-rc.2，两者不是同一套。改为手写环境声明 `src/dsh.d.ts` / `src/dsh.host.d.ts` /
+- **P2（verifier 发现，已修正）**：基座表在**运行中 asar** 里的真实来源文件，随宿主版本而变 ——
+  必须**动态读取**，不得硬编码：
+  - **当前运行中 asar（0.2.0-rc.2，`app.asar` mtime 2026-09-29 18:34:26）** =
+    `dsh-web-frontend/dist/assets/index-5SrrfWpU.js`；
+  - 更早的 rc.1 asar = `index-Dy0OhsZ5.js`；
+  - 计划初版引用的 `index-Q6zc2uHV.js` **只存在于 npm 0.1.7 安装**。
+  三者解析出的 **9 键基座表完全一致**（`platform-modules-check.mjs` 双源比对 PASS）。
+  → 教训：证据跨版本错位是"静默失效"的高发区，`facts-check.mjs` 因此把"必须引用运行中资源"做成了硬判据。
+- **不再安装 `@deepseek-ai/*` 类型包**：本机 GUI 是桌面端内置运行时，而 npm 上长期只有 0.1.7-rc.2，
+  两者不是同一套。改为手写环境声明 `src/dsh.d.ts` / `src/dsh.host.d.ts` /
   `src/dsh.client.d.ts`，每条都带证据来源注释。只从 npm 安装 `esbuild` / `typescript` / `@types/*`。
 
 ### 10.2 T1 完成状态
@@ -634,6 +638,64 @@ const sessions = useSessions()                            // 摘要 byId
 - **仍留在外面的低概率缺口（接受并留痕，非阻塞）**：回收站根台账损坏 ∧ 冷存档无台账 ∧ `batch.json` 也损坏
   → 该条目仍会漏报 → 幽灵行。彻底修法是再加一路**不依赖任何 JSON** 的来源（`purged/<批次>/<entryId>/` 的目录名
   + `session/` 存在性）。现在不做的理由：宿主侧每次改动都要用户重启一次，而该缺口需三处独立损坏同时发生。
+
+### 10.16 「live/attached」≠「running」：一次判据过宽导致的真实卡死（2026-09-29 晚，用户真机）
+- **现象**：用户删除 **fork/rewind 自动归档的源会话** 被拒 409 `session-live`「会话正在运行」，但该会话**早已停止运行**
+  （转写文件 mtime 停在 1.7 小时前）。
+- **根因**：旧判据 `ctx.get('sessions')?.get(id) !== undefined` 问的是"官方会话服务**是否持有**该会话"。
+  按官方术语这叫 **live / attached**（证据：`dsh-session-reference/lib/index.js:562` 注释 *"the listed session, live **or cold**"*），
+  **不等于"正在运行"**。fork/rewind 后源会话被自动归档却仍挂在内存里 → 既删不掉、也恢复不了（restore 用同一判据），用户被永久卡住。
+- **正确来源**（lead 逐行核对）：
+  ```js
+  ctx.get('sessionController').list(signal)   // 宿主签名只收 signal（lib/index.js:1888），返回裸数组
+  running:        this.ctx.agents.get(id)?.status === 'running'   // :1877 —— running 的精确语义
+  agentAvailable: this.ctx.agents.get(id)?.session === session    // :1876
+  // 注释 :1884 "Read every visible attached and persisted Session" → 冷/归档会话也在内，running:false（:1907-1914）
+  ```
+- ⚠️ **一个必须记住的坑（由 host-recycle 实测抓出）**：`lib/types/index.d.ts:75-80` 声明的
+  `list(_request: SessionListRequest, signal: AbortSignal): Promise<{items}>` 描述的是**客户端 Remote 形态**（`lib/client.js:2613` 的
+  `this.remote.session.list({})`）；**宿主实现完全不同**（`async list(signal)`，返回**裸数组**）。
+  照 .d.ts 字面在宿主侧调用 `list({}, signal)`，会把 `{}` 当 signal 用而抛错 → **所有 attached 会话被误判"无法判定"**。
+  实现因此对两种形态做了归一（`Array.isArray(raw) ? raw : raw.items`）并用 `wrapped` 用例锁住。
+  **教训：Typert 远端服务的 `.d.ts` 是远端契约，宿主调用必须读宿主 `lib/index.js` 实现。**
+- **新判据（必须有正面证据才放行）**：`runningIds.has(id)` → 409（文案现在才真的准确）；
+  **attached 但不在 `runningIds` → 放行**（用户的场景）；attached 且**无法判定**（服务缺失/抛错/2.5s 超时/形态不认识）→
+  **409 fail-safe**，文案说明"无法确认是否仍在运行"；cold 会话 → 放行且**完全不探测**（用例断言 `probes.length === 0`）。
+  `restore` 用同一函数、完全对称。**fail-safe 选拒绝的理由**：这套动作是"不可逆感知"的（工件被搬走、页面行消失），
+  而"无法判定"意味着我们**没有**"它没在跑"的正面证据 —— 拒绝的代价只是稍后重试，放行的代价是赌用户数据。
+- **为何不改成"未归档优先"**：优先级维持既有裁定（`session-not-archived` 先于 `session-live`），既有用例仍绿。
+  契约未改（不加新码，沿用 `session-live`）；`sessions` 服务整体缺失仍是 500 `internal`（fail-closed）。
+
+### 10.17 ⚠️ 会话进行到一半时，宿主**自动升级**了：0.2.0-rc.1 → **0.2.0-rc.2**
+- **实测证据**：`E:\DSH\resources\app.asar` 的 mtime = **2026-09-29 18:34:26**，其内 `/dsh/package.json` 已是
+  `@deepseek-ai/dsh-desktop-runtime@0.2.0-rc.2` 与 `@deepseek-ai/dsh@0.2.0-rc.2`；前端资源名由 `index-Dy0OhsZ5.js`
+  变为 `index-5SrrfWpU.js`。当前最早宿主进程起始 **18:47:41** ⇒ **进程晚于 asar**，即**现在运行的就是 rc.2**。
+- **发现方式（值得记）**：不是我们主动查出来的，而是 verifier 的 `facts-check.mjs` **报了一条 MISMATCH**
+  —— "PLAN 引用的基座表资源名与运行中 asar 的真实资源不一致"。这正是 §10.9 那条纪律（参照物要动态发现、
+  取不到/变了必须报错）在起作用：**证据跨版本错位没有静默通过**。
+- **对本插件的影响（已核对的部分）**：
+  - **插件在 rc.2 下工作正常**：用户在 rc.2 上打开了设置页、并收到了**本插件返回的** `409 session-live`（含我们的错误码与文案）
+    —— 这是比静态分析更强的 live 证据（页面渲染 + 4 条 `/api` 路由 + 错误契约都在 rc.2 上跑通了）。
+  - `scripts/check-routes-against-host.mjs` 现在读的是 **rc.2 asar**，**4/4 仍 PASS** ⇒ `/api` 路由规则未变。
+  - 9 键基座表：npm 参照树（仍是 0.1.7/rc.1）与 rc.2 asar 解析结果一致（`platform-modules-check.mjs` PASS）。
+- **尚未做**：verifier 的终版 A1–A7 是按 rc.1 定案的；**需要在 rc.2 上重跑一遍静态复核**并把版本标注刷新
+  （npm 参照树仍是旧版，这是它的已知局限）。目标验收口径也随之更新为"rc.1 逐项定案 + rc.2 实机复核"。
+- **教训**：交付期间宿主会自己升级；**"目标版本"必须带时间戳与 asar mtime**，否则"通过验收"这句话会随环境漂移而失真。
+
+### 10.18 工具坑：**PowerShell 嵌套引号**会让整轮队友工作作废
+- **现象**（本轮真实发生）：verifier 在 rc.2 复核中反复失败，它自己的原话是「PS 引号导致失败，改用我的 asar-probe」，
+  用户侧表现为"子代理命令卡住"。lead 用 `interrupt_agent` 中断了那一轮 → **文件系统无任何损失**，只是该轮作废
+  （`test/verify/logs/` 最新日志仍停在更早那份，可用来确认"没有产出"）。
+- **根因**：Windows PowerShell 里嵌套引号（外层双引号内再套双引号、或 `$()` 里再套引号）极易被打散，
+  轻则命令报错反复重试，重则停在等待输入上。
+- **规则（对 lead 与队友一致）**：
+  1. 需要跑脚本时**写文件再执行**（`.mjs`），或 `node -e` 用**单引号**包裹整段、内部只用双引号；
+     pwsh 里写 `@'…'@` here-string 最稳。
+  2. **不要写"一行流"的复杂 pwsh**，尤其不要嵌套引号。
+  3. 任何命令 **>60 s 无输出就跳过**并在报告里写"未覆盖（原因）"，**不要重试第三次**。
+  4. 症状是"看上去卡住"时，先判断是"阻塞等待"还是"自旋算不动"：看进程 CPU（自旋会累积 CPU，阻塞不会），
+     再看队友最后的原话（往往已经写明失败原因）。
+  5. 需要中止时用 `interrupt_agent`（保留其待办收件箱），并把"为什么中断 + 换什么写法"讲清楚再让它继续。
 
 ---
 
