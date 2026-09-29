@@ -1,0 +1,9 @@
+node_modules/
+lib/
+.tmp/
+backups/
+*.log
+
+# 项目记忆（memory/）与备份：仅本地保留，不进入版本库
+memory/
+*.bak-before-git-init

@@ -1,0 +1,9 @@
+# 本插件只做「增量插入」：不禁用、不替换任何官方条目。
+# 对照 @michengai/dsh-archive-manager-example/cordis.patch.yml —— 它 disabled 了
+# workspace / session-projection-cache 并插入 59KB 子类，那是版本脆弱性的来源。
+#
+# 宿主半侧（本插件的 Node 入口）注册 /api/dsh-archive-manager/* 的官方鉴权路由。
+# 浏览器半侧由 package.json 的 dsh.client 声明自动发现，无需在此登记。
+- insert:
+    - id: archive-manager
+      name: 'dsh-archive-manager'
